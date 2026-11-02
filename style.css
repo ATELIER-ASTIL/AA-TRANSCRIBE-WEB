@@ -237,3 +237,10 @@ details.adv summary { cursor: pointer; font-family: var(--display); text-transfo
 .caret { display: inline-block; width: 1px; height: 1.1em; background: var(--accent); margin-left: 4px; vertical-align: -2px; animation: aa-blink 1s steps(2) infinite; }
 @keyframes aa-blink { 50% { opacity: 0; } }
 @media (max-width: 900px) { .live-text .line { grid-template-columns: 48px 1fr; gap: 10px; } .live-text { max-height: 50vh; } }
+
+/* ---------- Claude summary */
+.summary { border-top: 1px solid var(--hairline); background: var(--paper); padding: 20px 24px 8px; margin-bottom: 32px; }
+.summary .label { color: var(--accent); display: block; margin-top: 4px; }
+.summary p { margin: 6px 0 16px; font-size: 15px; line-height: 1.75; }
+.summary ul { margin: 6px 0 16px; padding-left: 18px; font-size: 15px; line-height: 1.7; }
+.summary li::marker { color: var(--accent); }

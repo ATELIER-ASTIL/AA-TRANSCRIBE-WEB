@@ -187,6 +187,12 @@ worker.onmessage = async (ev) => {
       const segments = mergeSegments(m.segments).map((x, i) => ({ id: i, start: x.start, end: x.end, text: fix(x.text), speaker: "S1" }));
       await patch(job.id, { status: "done", draft: false, progress: 1, segments, model: m.model, device: m.device, language: m.output || "en", spoken: m.spoken || [], error: "" });
       toast(`“${job.title}” transcribed`);
+      if (getSettings().autoPolish && CLAUDE.key()) {
+        emit({ type: "changed", id: job.id });
+        showJob("Polishing with Claude", job.title, 0.05);
+        try { await polishWithClaude(job.id, (p, t) => showJob("Polishing with Claude", `${job.title} · ${t}`, p)); toast(`“${job.title}” polished with Claude`); }
+        catch (e) { toast("Claude polish skipped: " + e.message, 7000); }
+      }
     } else {
       await patch(job.id, { status: "error", error: m.message });
       toast("Transcription failed: " + m.message, 6000);
@@ -384,12 +390,17 @@ async function renderTranscript(id) {
         <input class="doc-title" id="title" value="${esc(rec.title)}" aria-label="Title">
         <div class="meta" id="meta"></div>
         <div id="notice"></div>
+        <div id="summary"></div>
         <div class="find"><label class="field" style="flex:1"><span>Find in transcript</span><input type="search" id="find" placeholder="Search this transcript"></label><span class="small muted" id="findCount"></span></div>
         <div id="segs"></div>
       </div>
       <aside class="side">
         <section><h2>Speakers</h2><div id="spks"></div>
           <p class="small muted" style="margin:8px 0 0">Click a speaker name in the transcript to assign that line. Rename here; every line updates.</p></section>
+        <section><h2>Polish with Claude</h2>
+          <p class="small muted" style="margin-top:-6px" id="polishInfo"></p>
+          <div class="row"><button class="btn primary" id="polish">Polish with Claude</button><button class="btn ghost" id="unpolish" hidden>Restore original</button></div>
+        </section>
         <section><h2>Export</h2>
           <div class="exports">${["docx", "txt", "md", "srt", "vtt", "json"].map((f) => `<button class="btn" data-fmt="${f}">${f}</button>`).join("")}</div>
           <div class="checks"><label><input type="checkbox" id="xTs" checked> Timestamps in TXT</label><label><input type="checkbox" id="xSpk" checked> Speakers in TXT</label></div>
@@ -419,6 +430,36 @@ async function renderTranscript(id) {
 
   const save = async (changes, msg) => { rec = await patch(id, changes); if (msg) toast(msg); };
   const speakerName = (c) => (rec.speakers || {})[c] || "Speaker " + String(c).replace("S", "");
+
+  function drawPolish() {
+    const p = rec.polished, has = !!CLAUDE.key();
+    $("#polishInfo").innerHTML = p
+      ? `Polished ${fmtDate(p.at)} · cost about ₹${Math.max(1, Math.round(p.usd * 88))}. Corrects misheard words and translation from the meaning of the conversation, and writes the summary.`
+      : has ? "Claude reads the whole conversation, corrects misheard words and translation, and writes a summary with action items. Pay per use, about ₹10 to ₹15 per hour of meeting."
+            : `Add your Claude API key in <a href="#/settings" style="text-decoration:underline">Settings</a> to use this.`;
+    $("#polish").textContent = p ? "Polish again" : "Polish with Claude";
+    $("#polish").disabled = !has || rec.status !== "done" || !rec.segments.length;
+    $("#unpolish").hidden = !rec.segments_original;
+    $("#summary").innerHTML = summaryHtml(rec.summary);
+  }
+  let polishing = null;
+  $("#polish").onclick = async () => {
+    if (polishing) { polishing.abort(); return; }
+    polishing = new AbortController();
+    const btn = $("#polish"); btn.textContent = "Stop";
+    showJob("Claude", "Starting", 0.02);
+    try {
+      rec = await polishWithClaude(id, (p, t) => showJob("Polishing with Claude", t, p), polishing.signal);
+      toast("Polished with Claude"); drawMeta(); drawSegments(); drawPolish();
+    } catch (e) { if (e.name !== "AbortError") toast(e.message, 7000); }
+    finally { polishing = null; hideJob(); drawPolish(); }
+  };
+  cleanup.push(() => polishing && polishing.abort());
+  $("#unpolish").onclick = async () => {
+    if (!confirm("Restore the original transcript and remove Claude's corrections and summary?")) return;
+    rec = await patch(id, { segments: rec.segments_original, segments_original: null, summary: null, polished: null });
+    drawSegments(); drawPolish(); toast("Original restored");
+  };
 
   function drawMeta() {
     $("#meta").textContent = `${rec.project || "Unassigned"} · ${fmtDate(rec.created)} · ${fmtTime(rec.duration)} · ${rec.source === "record" ? "Recorded here" : rec.original_name}`;
@@ -550,7 +591,7 @@ async function renderTranscript(id) {
   };
   $("#rGo").onclick = async () => {
     if (!confirm("Re-transcribe this recording? Edits to the text will be replaced.")) return;
-    rec = await patch(id, { status: "queued", progress: 0, model_req: $("#rModel").value, language_req: $("#rLang").value, mode_req: $("#rMode").value, error: "" });
+    rec = await patch(id, { status: "queued", progress: 0, model_req: $("#rModel").value, language_req: $("#rLang").value, mode_req: $("#rMode").value, error: "", segments_original: null, summary: null, polished: null });
     enqueue(id); drawMeta(); toast("Queued for re-transcription");
   };
   $("#del").onclick = async () => {
@@ -562,11 +603,11 @@ async function renderTranscript(id) {
   const onEv = async (e) => {
     if (e.id !== id) return;
     if (e.type === "live") { const l = $("#live"); if (l) l.textContent = e.text; return; }
-    rec = await DB.get(id); drawMeta(); drawSpeakers(); drawSegments();
+    rec = await DB.get(id); drawMeta(); drawSpeakers(); drawSegments(); drawPolish();
   };
   listeners.add(onEv); cleanup.push(() => listeners.delete(onEv));
   every(async () => { if (rec.status === "processing") { rec = await DB.get(id); const live = $("#live")?.textContent; drawMeta(); if (live && $("#live")) $("#live").textContent = live; } }, 2500);
-  drawMeta(); drawSpeakers(); drawSegments();
+  drawMeta(); drawSpeakers(); drawSegments(); drawPolish();
 }
 
 /* ---------------------------------------------------------------- record (live transcript) */
@@ -796,13 +837,19 @@ async function renderSettings() {
         <p class="help">Fix words the engine consistently mishears. Matching ignores case and whole words only.</p>
         <table class="rules"><thead><tr><th>Heard</th><th>Write as</th><th></th></tr></thead><tbody id="rules"></tbody></table>
         <button class="btn ghost" id="addRule" style="margin-top:12px">+ Add correction</button>
+        <h2 style="margin-top:56px">Claude</h2>
+        <p class="help">Polish with Claude corrects transcripts from the meaning of the conversation and writes summaries and action items. Pay per use through your own Anthropic account. Transcript text is sent to Anthropic; audio is not.</p>
+        <label class="field" style="margin-bottom:16px"><span>Claude API key</span><input type="password" id="ckey" autocomplete="off" placeholder="${CLAUDE.key() ? "Saved on this device · paste to replace" : "sk-ant-…"}"></label>
+        <div class="checks" style="margin-bottom:12px"><label><input type="checkbox" id="autoPolish" ${s.autoPolish ? "checked" : ""}> Polish every transcript automatically</label></div>
+        <div class="row"><button class="btn" id="ctest">Test key</button>${CLAUDE.key() ? `<button class="btn ghost" id="cclear">Remove key</button>` : ""}</div>
+        <p class="small muted">The key is stored only in this browser on this device. Set a monthly spend limit at platform.claude.com.</p>
         <h2 style="margin-top:56px">This device</h2>
         <dl class="kv"><dt>Storage</dt><dd>${esc(usage || "—")}</dd><dt>Recordings</dt><dd>${(await DB.all()).length}</dd></dl>
         <div class="row" style="margin-top:16px"><button class="btn" id="backup">Export all transcripts</button></div>
         <div class="row" style="margin-top:40px"><button class="btn primary" id="saveS">Save settings</button></div>
       </section>
     </div>
-    <p class="privacy">Speech recognition runs inside this browser using the open-source Whisper model. Recordings and transcripts never leave this device; the only download is the speech model itself, once.</p>`;
+    <p class="privacy">Speech recognition runs inside this browser using the open-source Whisper model. Recordings never leave this device. Transcript text leaves only when you use Polish with Claude.</p>`;
   let rules = s.replacements.map((r) => ({ ...r }));
   const drawRules = () => {
     $("#rules").innerHTML = rules.map((r, i) => `<tr><td><input type="text" data-i="${i}" data-k="find" value="${esc(r.find)}" placeholder="v r f"></td><td><input type="text" data-i="${i}" data-k="replace" value="${esc(r.replace)}" placeholder="VRF"></td><td><button class="x" data-del="${i}" aria-label="Remove">×</button></td></tr>`).join("");
@@ -813,9 +860,18 @@ async function renderSettings() {
   $("#addRule").onclick = () => { rules.push({ find: "", replace: "" }); drawRules(); };
   $("#saveS").onclick = () => {
     saveSettings({ ...s, model: ($$('input[name="model"]').find((r) => r.checked) || {}).value || "", language: $("#dLang").value, mode: $("#dMode").value,
-      vocabulary: $("#vocab").value.split("\n").map((x) => x.trim()).filter(Boolean), replacements: rules.filter((r) => r.find.trim()) });
+      vocabulary: $("#vocab").value.split("\n").map((x) => x.trim()).filter(Boolean), replacements: rules.filter((r) => r.find.trim()), autoPolish: $("#autoPolish").checked });
+    if ($("#ckey").value.trim()) CLAUDE.setKey($("#ckey").value.trim());
     toast("Settings saved"); updateChip();
   };
+  $("#ctest").onclick = async () => {
+    const typed = $("#ckey").value.trim();
+    if (typed) CLAUDE.setKey(typed);
+    if (!CLAUDE.key()) return toast("Paste a Claude API key first.", 4000);
+    try { await claudeCall("Reply with the single word OK.", "Test", 5); toast("Claude key works and is saved on this device."); renderSettings(); }
+    catch (e) { toast(e.message, 7000); }
+  };
+  $("#cclear") && ($("#cclear").onclick = () => { CLAUDE.setKey(""); toast("Key removed from this device"); renderSettings(); });
   $("#backup").onclick = async () => {
     const recs = (await DB.all()).filter((r) => r.status === "done");
     if (!recs.length) return toast("No finished transcripts yet.");
@@ -823,6 +879,130 @@ async function renderSettings() {
     recs.forEach((r) => zip.file(`${safeName(r.title)}-${r.id.slice(0, 4)}.txt`, toTxt(r, true, true)));
     download(await zip.generateAsync({ type: "blob" }), `AA-Transcripts-${new Date().toISOString().slice(0, 10)}.zip`);
   };
+}
+
+/* ---------------------------------------------------------------- Claude polish (pay per use) */
+const CLAUDE = {
+  key() { try { return localStorage.getItem("aa_claude_key") || ""; } catch (_) { return ""; } },
+  setKey(k) { try { k ? localStorage.setItem("aa_claude_key", k) : localStorage.removeItem("aa_claude_key"); } catch (_) {} },
+  model: "claude-sonnet-5-5",
+  // USD per million tokens, for the cost line shown after each polish
+  price: { in: 2, out: 10 },
+};
+
+async function claudeCall(system, user, maxTokens, signal) {
+  const key = CLAUDE.key();
+  if (!key) throw new Error("Add your Claude API key in Settings first.");
+  if (MOCK) return mockClaude(user);
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST", signal,
+      headers: {
+        "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({ model: CLAUDE.model, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return { text: (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join(""), usage: data.usage || {}, stop: data.stop_reason };
+    }
+    let msg = res.statusText;
+    try { msg = (await res.json()).error?.message || msg; } catch (_) {}
+    if ((res.status === 429 || res.status === 529 || res.status >= 500) && attempt < 4) { await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt)); continue; }
+    if (res.status === 401) throw new Error("The Claude API key was not accepted. Check it in Settings.");
+    if (res.status === 400 && /credit|balance/i.test(msg)) throw new Error("The Claude account has no credit. Add credit at platform.claude.com.");
+    throw new Error(`Claude: ${msg}`);
+  }
+}
+
+function parseJson(text) {
+  const t = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+  try { return JSON.parse(t); } catch (_) {}
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));
+  throw new Error("Claude returned an unexpected answer. Try again.");
+}
+
+const POLISH_SYSTEM = `You correct automatic speech-recognition transcripts for Atelier Astil, a luxury architecture and interior design studio in Bengaluru, India.
+
+The transcript was produced by the Whisper speech model. It may contain misheard words, wrong homophones, broken punctuation, and stiff or broken English where Hindi, Kannada or other Indian languages were machine-translated.
+
+Correct each line so it says what the speaker actually meant:
+- Fix misheard words using the conversation's context and the studio glossary (architecture, interiors, MEP and site terms, client and project names).
+- Rewrite any remaining non-English words, and awkward machine translations, as natural Indian-business English. Keep the speaker's meaning and tone.
+- Fix punctuation and capitalisation. Write numbers, dimensions, units and money as professionals write them (600 mm, 1,200 sq ft, ₹4.5 lakh, 2nd floor).
+- Never add information, never summarise, never merge, split, drop or reorder lines. One output line per input line, same id.
+- When a line cannot be confidently corrected, keep it as it is.
+
+Reply with JSON only: {"lines":[{"id":<number>,"text":"<corrected line>"}]}`;
+
+const SUMMARY_SYSTEM = `You write meeting notes for Atelier Astil, a luxury architecture and interior design studio in Bengaluru. Read the transcript and reply with JSON only:
+{"summary":"<3 to 6 sentences>","decisions":["..."],"actions":[{"owner":"<name or role, or empty>","task":"...","due":"<date or empty>"}],"open_questions":["..."]}
+Use only what was said. Write in concise professional English. Use empty lists when there is nothing to report.`;
+
+async function polishWithClaude(id, onProgress, signal) {
+  const rec = await DB.get(id);
+  if (!rec || !rec.segments.length) throw new Error("There is no transcript to polish yet.");
+  const s = getSettings();
+  const original = rec.segments_original || rec.segments;
+  const speakerName = (c) => (rec.speakers || {})[c] || "Speaker " + String(c).replace("S", "");
+  const context = `Studio glossary: ${s.vocabulary.join(", ")}\nProject: ${rec.project || "not stated"}\nRecording title: ${rec.title}${rec.notes ? "\nNotes: " + rec.notes : ""}`;
+  const batches = [];
+  for (let i = 0; i < original.length; i += 60) batches.push(original.slice(i, i + 60).map((seg, k) => ({ ...seg, n: i + k })));
+  const fixed = original.map((x) => x.text);
+  let tin = 0, tout = 0;
+  for (let b = 0; b < batches.length; b++) {
+    onProgress && onProgress(b / (batches.length + 1), `Polishing part ${b + 1} of ${batches.length}`);
+    const before = b ? fixed.slice(Math.max(0, batches[b][0].n - 8), batches[b][0].n).join("\n") : "";
+    const user = `${context}\n\n${before ? "The conversation just before these lines (already corrected, for context only):\n" + before + "\n\n" : ""}Lines to correct (id | speaker | text):\n` +
+      batches[b].map((x) => `${x.n} | ${speakerName(x.speaker)} | ${x.text}`).join("\n");
+    const { text, usage } = await claudeCall(POLISH_SYSTEM, user, 16000, signal);
+    tin += usage.input_tokens || 0; tout += usage.output_tokens || 0;
+    const json = parseJson(text);
+    for (const line of json.lines || []) {
+      const n = Number(line.id);
+      if (Number.isInteger(n) && n >= batches[b][0].n && n <= batches[b][batches[b].length - 1].n && typeof line.text === "string" && line.text.trim()) fixed[n] = line.text.trim();
+    }
+  }
+  onProgress && onProgress(batches.length / (batches.length + 1), "Writing summary and action items");
+  const full = original.map((x, i) => `${speakerName(x.speaker)}: ${fixed[i]}`).join("\n").slice(0, 400000);
+  let summary = null;
+  try {
+    const r = await claudeCall(SUMMARY_SYSTEM, `${context}\n\nTranscript:\n${full}`, 4000, signal);
+    tin += r.usage.input_tokens || 0; tout += r.usage.output_tokens || 0;
+    summary = parseJson(r.text);
+  } catch (e) { if (signal && signal.aborted) throw e; }
+  const usd = (tin * CLAUDE.price.in + tout * CLAUDE.price.out) / 1e6;
+  const fresh = await DB.get(id);
+  fresh.segments_original = original;
+  fresh.segments = original.map((x, i) => ({ ...x, speaker: (fresh.segments[i] || x).speaker, text: fixed[i] }));
+  fresh.summary = summary;
+  fresh.polished = { at: Date.now(), model: CLAUDE.model, usd, tokens: tin + tout };
+  await DB.put(fresh);
+  return fresh;
+}
+
+function mockClaude(user) {
+  if (user.includes("Lines to correct")) {
+    const lines = user.split("Lines to correct (id | speaker | text):\n")[1].split("\n").map((l) => {
+      const [id, , ...rest] = l.split(" | ");
+      const t = rest.join(" | ").replace(/^the /, "The ").replace(/v r f/gi, "VRF");
+      return { id: Number(id), text: t.replace(/\.?$/, ".") };
+    });
+    return Promise.resolve({ text: JSON.stringify({ lines }), usage: { input_tokens: 900, output_tokens: 400 } });
+  }
+  return Promise.resolve({ text: JSON.stringify({ summary: "The team reviewed the BOQ for the false ceiling and the VRF layout ahead of the site review.", decisions: ["Proceed with the revised false ceiling BOQ."], actions: [{ owner: "Site team", task: "Issue the VRF layout for review", due: "Tomorrow" }], open_questions: [] }), usage: { input_tokens: 1200, output_tokens: 200 } });
+}
+
+function summaryHtml(sm) {
+  if (!sm) return "";
+  const list = (arr) => arr && arr.length ? `<ul>${arr.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "";
+  const acts = sm.actions && sm.actions.length ? `<ul>${sm.actions.map((a) => `<li>${esc(a.task)}${a.owner ? ` <span class="muted">· ${esc(a.owner)}</span>` : ""}${a.due ? ` <span class="muted">· ${esc(a.due)}</span>` : ""}</li>`).join("")}</ul>` : "";
+  return `<div class="summary"><span class="label">Summary</span><p>${esc(sm.summary || "")}</p>
+    ${sm.decisions && sm.decisions.length ? `<span class="label">Decisions</span>${list(sm.decisions)}` : ""}
+    ${acts ? `<span class="label">Action items</span>${acts}` : ""}
+    ${sm.open_questions && sm.open_questions.length ? `<span class="label">Open questions</span>${list(sm.open_questions)}` : ""}</div>`;
 }
 
 /* ---------------------------------------------------------------- exports */
@@ -834,7 +1014,15 @@ function ts(sec, sep = ".") {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}${sep}${String(ms).padStart(3, "0")}`;
 }
 function toTxt(r, withTs, withSpk) {
-  const head = `${r.title.toUpperCase()}\n${r.project || "Atelier Astil"} · ${fmtDate(r.created)} · ${fmtTime(r.duration)}\n\n`;
+  let head = `${r.title.toUpperCase()}\n${r.project || "Atelier Astil"} · ${fmtDate(r.created)} · ${fmtTime(r.duration)}\n\n`;
+  if (r.summary) {
+    const sm = r.summary;
+    head += `SUMMARY\n${sm.summary || ""}\n\n`;
+    if (sm.decisions?.length) head += `DECISIONS\n${sm.decisions.map((d) => "- " + d).join("\n")}\n\n`;
+    if (sm.actions?.length) head += `ACTION ITEMS\n${sm.actions.map((a) => "- " + a.task + ([a.owner, a.due].filter(Boolean).length ? " (" + [a.owner, a.due].filter(Boolean).join(", ") + ")" : "")).join("\n")}\n\n`;
+    if (sm.open_questions?.length) head += `OPEN QUESTIONS\n${sm.open_questions.map((q) => "- " + q).join("\n")}\n\n`;
+    head += "TRANSCRIPT\n\n";
+  }
   return head + r.segments.map((s) => {
     const h = [withTs ? `[${fmtTime(s.start)}]` : "", withSpk ? nameOf(r, s).toUpperCase() : ""].filter(Boolean).join(" ");
     return (h ? h + "\n" : "") + s.text;
@@ -870,6 +1058,14 @@ async function buildDocx(r) {
     + para(run(r.title.toUpperCase(), { font: EG, size: 36, spacing: 30 }))
     + para(run(`${r.project || "Atelier Astil"} · ${fmtDate(r.created)} · ${fmtTime(r.duration)}`, { size: 18, color: "6B5C4B" }), { border: true, after: 240 });
   if (r.notes) body += para(run(r.notes, { size: 20, color: "6B5C4B" }));
+  if (r.summary) {
+    const sm = r.summary, head = (t) => para(run(t, { font: EG, size: 16, color: "8D7040", spacing: 30 }), { before: 200, after: 60 });
+    body += head("SUMMARY") + para(run(sm.summary || "", { size: 20 }), { after: 120 });
+    if (sm.decisions && sm.decisions.length) body += head("DECISIONS") + sm.decisions.map((d) => para(run("·  " + d, { size: 20 }), { after: 40 })).join("");
+    if (sm.actions && sm.actions.length) body += head("ACTION ITEMS") + sm.actions.map((a) => para(run("·  " + a.task, { size: 20 }) + run([a.owner, a.due].filter(Boolean).length ? "   " + [a.owner, a.due].filter(Boolean).join(" · ") : "", { size: 18, color: "6B5C4B" }), { after: 40 })).join("");
+    if (sm.open_questions && sm.open_questions.length) body += head("OPEN QUESTIONS") + sm.open_questions.map((q) => para(run("·  " + q, { size: 20 }), { after: 40 })).join("");
+    body += para(run("TRANSCRIPT", { font: EG, size: 16, color: "8D7040", spacing: 30 }), { before: 320, after: 60, border: true });
+  }
   if (names.length) body += para(run("PARTICIPANTS   ", { font: EG, size: 16, color: "6B5C4B", spacing: 30 }) + run(names.join(" · "), { size: 19 }), { after: 200 });
   for (const s of r.segments) {
     body += para(run(nameOf(r, s).toUpperCase(), { font: EG, size: 16, spacing: 30 }) + run("   " + fmtTime(s.start), { size: 16, color: "6B5C4B" }), { before: 200, after: 0, keep: true });
