@@ -10,7 +10,7 @@ const MOCK = new URLSearchParams(location.search).get("mock") === "1";
 let timers = [], cleanup = [];
 
 const LANGS = [
-  ["auto", "Detect automatically"], ["en", "English"], ["hi", "Hindi"], ["kn", "Kannada"], ["ta", "Tamil"],
+  ["auto", "Detect automatically (mixed languages)"], ["en", "English"], ["hi", "Hindi"], ["kn", "Kannada"], ["ta", "Tamil"],
   ["te", "Telugu"], ["ml", "Malayalam"], ["mr", "Marathi"], ["gu", "Gujarati"], ["bn", "Bengali"],
   ["pa", "Punjabi"], ["ur", "Urdu"], ["ar", "Arabic"], ["fr", "French"], ["de", "German"], ["es", "Spanish"],
   ["it", "Italian"], ["pt", "Portuguese"], ["ja", "Japanese"], ["zh", "Chinese"], ["ru", "Russian"],
@@ -43,7 +43,7 @@ const fmtBytes = (b) => (b > 1e9 ? (b / 1e9).toFixed(1) + " GB" : Math.round(b /
 
 /* ---------------------------------------------------------------- settings (this browser) */
 const DEFAULT_SETTINGS = {
-  model: "", language: "en", task: "transcribe",
+  v: 2, model: "", language: "auto", mode: "english",
   vocabulary: ["Atelier Astil", "Arpita", "BOQ", "GFC", "IFC", "MEP", "HVAC", "FCU", "AHU", "VRF", "VRV", "BMS", "PHE",
     "FF&E", "AutoCAD", "XREF", "BBMP", "NBC", "LEED", "IGBC", "WELL", "CCTV", "RCP", "PU finish", "Corian", "Italian marble",
     "pelmet", "roman blind", "roller blind", "snag list", "shop drawing", "GA drawing", "Bengaluru"],
@@ -53,9 +53,16 @@ const DEFAULT_SETTINGS = {
   ],
 };
 function getSettings() {
-  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem("aa_settings") || "{}") }; }
-  catch (_) { return { ...DEFAULT_SETTINGS }; }
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("aa_settings") || "{}"); } catch (_) {}
+  if ((stored.v || 1) < 2) {            // earlier versions: English output becomes the default
+    stored.mode = stored.task === "transcribe" ? "english" : "english";
+    stored.language = "auto"; stored.v = 2; delete stored.task;
+  }
+  return { ...DEFAULT_SETTINGS, ...stored };
 }
+const OUTPUTS = [["english", "English — translate every language"], ["original", "Spoken language as is"]];
+const outputOptions = (sel) => OUTPUTS.map(([v, n]) => `<option value="${v}" ${v === sel ? "selected" : ""}>${n}</option>`).join("");
 function saveSettings(s) { try { localStorage.setItem("aa_settings", JSON.stringify(s)); } catch (_) {} }
 
 function makeCorrector(vocab, reps) {
@@ -86,6 +93,11 @@ async function checkDevice() {
 }
 function autoModel() { return DEVICE.webgpu && DEVICE.f16 ? "best" : "balanced"; }
 function chosenModel() { const s = getSettings(); return s.model || autoModel(); }
+function spokenLabel(r) {
+  const sp = (r.spoken || []).map(langName);
+  const into = r.language === "en" && sp.length && !(sp.length === 1 && r.spoken[0] === "en") ? " → English" : "";
+  return (sp.join(" + ") || langName(r.language)) + into;
+}
 
 /* ---------------------------------------------------------------- storage (IndexedDB) */
 const DB = {
@@ -173,7 +185,7 @@ worker.onmessage = async (ev) => {
     if (m.type === "done") {
       const s = getSettings(), fix = makeCorrector(s.vocabulary, s.replacements);
       const segments = mergeSegments(m.segments).map((x, i) => ({ id: i, start: x.start, end: x.end, text: fix(x.text), speaker: "S1" }));
-      await patch(job.id, { status: "done", draft: false, progress: 1, segments, model: m.model, device: m.device, language: job.language, error: "" });
+      await patch(job.id, { status: "done", draft: false, progress: 1, segments, model: m.model, device: m.device, language: m.output || "en", spoken: m.spoken || [], error: "" });
       toast(`“${job.title}” transcribed`);
     } else {
       await patch(job.id, { status: "error", error: m.message });
@@ -204,7 +216,7 @@ async function next() {
   const rec = await DB.get(id);
   if (!rec) return next();
   const s = getSettings();
-  active = { id, title: rec.title, progress: 0, language: rec.language_req || s.language };
+  active = { id, title: rec.title, progress: 0, language: rec.language_req || s.language, mode: rec.mode_req || s.mode };
   await patch(id, { status: "processing", progress: 0, error: "" });
   emit({ type: "changed", id });
   showJob("Reading audio", rec.title, 0);
@@ -213,9 +225,9 @@ async function next() {
     const audio = await decodeTo16k(blob);
     await patch(id, { duration: audio.length / 16000 });
     await checkDevice();
-    const key = rec.model_req || chosenModel();
+    const key = rec.model_req || s.model || "";
     worker.postMessage({ type: "transcribe", id, audio, key, device: DEVICE.webgpu ? "webgpu" : "wasm", f16: DEVICE.f16,
-      language: active.language, task: s.task }, [audio.buffer]);
+      language: active.language, mode: active.mode }, [audio.buffer]);
   } catch (e) {
     const job = active; active = null;
     await patch(id, { status: "error", error: "This file could not be read by the browser: " + e.message });
@@ -236,7 +248,7 @@ async function addRecording(blob, name, meta = {}) {
     id, title: meta.title || name.replace(/\.[^.]+$/, "").replace(/[_]+/g, " "), project: meta.project || "",
     source: meta.source || "upload", original_name: name, created: Date.now(), duration: meta.duration || 0,
     status: "queued", progress: 0, segments: [], speakers: { S1: "Speaker 1" }, notes: "",
-    language_req: meta.language || s.language, model_req: "", mime: blob.type,
+    language_req: meta.language || s.language, mode_req: meta.mode || s.mode, model_req: "", mime: blob.type,
   };
   await DB.putAudio(id, blob);
   await DB.put(rec);
@@ -275,9 +287,9 @@ async function renderLibrary() {
     </div>
     <div class="upload-opts">
       <label class="field"><span>Project</span><input type="text" id="upProject" list="projList" placeholder="e.g. CKPC"></label>
-      <label class="field"><span>Language</span><select id="upLang">${langOptions(s.language)}</select></label>
+      <label class="field"><span>Spoken language</span><select id="upLang">${langOptions(s.language)}</select></label>
+      <label class="field"><span>Text in</span><select id="upMode">${outputOptions(s.mode)}</select></label>
       <label class="field"><span>Title</span><input type="text" id="upTitle" placeholder="From file name"></label>
-      <span></span>
     </div>
     <datalist id="projList"></datalist>
     <div class="filters">
@@ -298,7 +310,7 @@ async function renderLibrary() {
   async function add(files) {
     files = files.filter((f) => f.size);
     for (const f of files) {
-      await addRecording(f, f.name, { title: files.length === 1 ? $("#upTitle").value.trim() : "", project: $("#upProject").value.trim(), language: $("#upLang").value });
+      await addRecording(f, f.name, { title: files.length === 1 ? $("#upTitle").value.trim() : "", project: $("#upProject").value.trim(), language: $("#upLang").value, mode: $("#upMode").value });
     }
     if (files.length) { toast(files.length === 1 ? "Added. Transcription has started." : `${files.length} files added to the queue.`); $("#upTitle").value = ""; }
     load();
@@ -348,7 +360,7 @@ function drawList(items, q) {
     return `<a class="item" href="#/r/${r.id}">
       <span class="num">${reg(i + 1)}</span>
       <span><div class="t">${esc(r.title)}</div>
-        <div class="m">${esc(r.project || "Unassigned")} · ${fmtDate(r.created)} · ${r.source === "record" ? "Recorded" : "Upload"}${r.status === "done" && r.language ? " · " + esc(langName(r.language)) : ""}</div>
+        <div class="m">${esc(r.project || "Unassigned")} · ${fmtDate(r.created)} · ${r.source === "record" ? "Recorded" : "Upload"}${r.status === "done" ? " · " + esc(spokenLabel(r)) : ""}</div>
         ${snip ? `<div class="snip">${snip}</div>` : ""}</span>
       <span class="status">${statusHtml(r)}</span></a>`;
   }).join("");
@@ -389,7 +401,8 @@ async function renderTranscript(id) {
         <section><h2>Re-transcribe</h2>
           <p class="small muted" style="margin-top:-6px">Run again with another model or language, or after adding glossary terms. Edits to the text are replaced.</p>
           <label class="field" style="margin-bottom:16px"><span>Model</span><select id="rModel">${Object.entries(MODEL_INFO).map(([k, v]) => `<option value="${k}" ${k === (rec.model_req || chosenModel()) ? "selected" : ""}>${v.name}</option>`).join("")}</select></label>
-          <label class="field" style="margin-bottom:16px"><span>Language</span><select id="rLang">${langOptions(rec.language_req || "en")}</select></label>
+          <label class="field" style="margin-bottom:16px"><span>Spoken language</span><select id="rLang">${langOptions(rec.language_req || "auto")}</select></label>
+          <label class="field" style="margin-bottom:16px"><span>Text in</span><select id="rMode">${outputOptions(rec.mode_req || "english")}</select></label>
           <div class="row"><button class="btn" id="rGo">Re-transcribe</button><button class="btn ghost danger" id="del">Delete</button></div></section>
       </aside>
     </div>
@@ -409,7 +422,7 @@ async function renderTranscript(id) {
 
   function drawMeta() {
     $("#meta").textContent = `${rec.project || "Unassigned"} · ${fmtDate(rec.created)} · ${fmtTime(rec.duration)} · ${rec.source === "record" ? "Recorded here" : rec.original_name}`;
-    $("#kv").innerHTML = `<dt>Language</dt><dd>${esc(langName(rec.language))}</dd><dt>Model</dt><dd>${esc((rec.model || "—").split("/").pop())}</dd>
+    $("#kv").innerHTML = `<dt>Spoken</dt><dd>${esc((rec.spoken || []).map(langName).join(", ") || "—")}</dd><dt>Text in</dt><dd>${esc(langName(rec.language))}</dd><dt>Model</dt><dd>${esc((rec.model || "—").split("/").pop())}</dd>
       <dt>Processed with</dt><dd>${rec.device === "webgpu" ? "Graphics (fast)" : rec.device ? "Processor" : "—"}</dd>
       <dt>Words</dt><dd>${rec.segments.reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0).toLocaleString("en-IN")}</dd>`;
     const n = $("#notice");
@@ -537,7 +550,7 @@ async function renderTranscript(id) {
   };
   $("#rGo").onclick = async () => {
     if (!confirm("Re-transcribe this recording? Edits to the text will be replaced.")) return;
-    rec = await patch(id, { status: "queued", progress: 0, model_req: $("#rModel").value, language_req: $("#rLang").value, error: "" });
+    rec = await patch(id, { status: "queued", progress: 0, model_req: $("#rModel").value, language_req: $("#rLang").value, mode_req: $("#rMode").value, error: "" });
     enqueue(id); drawMeta(); toast("Queued for re-transcription");
   };
   $("#del").onclick = async () => {
@@ -582,7 +595,7 @@ async function renderRecord() {
   view.innerHTML = `
     <div class="live">
       <span class="eyebrow">02 · Record</span><h1>Live transcript</h1>
-      <div class="muted">Words appear as people speak. When you stop, the full recording is transcribed again with the accurate model.</div>
+      <div class="muted">Words appear as people speak, in English whatever language is spoken. When you stop, the full recording is transcribed again with complete context.</div>
       <div class="rec-panel">
         <button class="rec-btn" id="rec" aria-label="Start recording"><i></i></button>
         <div><div class="clock" id="clock">00:00:00</div>
@@ -592,7 +605,8 @@ async function renderRecord() {
       <div class="row" style="margin-bottom:40px">
         <label class="field grow"><span>Title</span><input type="text" id="lTitle" placeholder="e.g. Site meeting — CKPC 3rd floor"></label>
         <label class="field" style="min-width:180px"><span>Project</span><input type="text" id="lProject" list="lp"><datalist id="lp">${projects.map((p) => `<option value="${esc(p)}">`).join("")}</datalist></label>
-        <label class="field" style="min-width:200px"><span>Language</span><select id="lLang">${langOptions(s.language === "auto" ? "en" : s.language)}</select></label>
+        <label class="field" style="min-width:200px"><span>Spoken language</span><select id="lLang">${langOptions(s.language)}</select></label>
+        <label class="field" style="min-width:220px"><span>Text in</span><select id="lMode">${outputOptions(s.mode)}</select></label>
       </div>
       <div class="live-head"><h2>Transcript</h2><label class="checks" style="margin:0"><label><input type="checkbox" id="follow" checked> Follow</label></label></div>
       <div class="live-text" id="out"><p class="muted">Press the bronze button and start speaking. Text appears here within a few seconds.</p></div>
@@ -609,17 +623,22 @@ async function renderRecord() {
     if (m.type === "live-loading") { $("#recState").textContent = `Downloading the speech model, one time only · ${Math.round(m.progress || 0)}%${m.total ? " of " + fmtBytes(m.total) : ""}`; }
     else if (m.type === "live-ready") { liveReady = true; if (!recording) $("#recState").textContent = "Ready. The browser will ask for microphone access."; }
     else if (m.type === "live-error") { busy = false; if (m.seq === finalSeq && finalDone) finalDone(); if (!recording) $("#recState").textContent = "Live preview unavailable on this device. Recording still works and is transcribed when you stop."; }
-    else if (m.type === "live-result") handleResult(m);
+    else if (m.type === "live-result") {
+      if (m.lang && recording) $("#recState").textContent = `Recording · hearing ${langName(m.lang)}${$("#lMode").value === "english" && m.lang !== "en" ? " → writing in English" : ""}`;
+      handleResult(m);
+    }
   };
   liveHandlers.add(onLive);
   cleanup.push(() => liveHandlers.delete(onLive));
-  worker.postMessage({ type: "live-preload", device, f16: DEVICE.f16 });
+  const preload = () => { liveReady = false; worker.postMessage({ type: "live-preload", device, f16: DEVICE.f16, mode: $("#lMode").value }); };
+  preload();
+  $("#lMode").onchange = () => { if (!recording) { $("#recState").textContent = "Preparing the speech model…"; preload(); } };
 
   function draw() {
     if (!committed.length && !partial) return;
     const html = committed.map((c) => {
-      return `<p class="line">${c.showTime ? `<span class="ts">${fmtTime(c.start)}</span>` : `<span class="ts"></span>`}${esc(c.text)}</p>`;
-    }).join("") + (partial ? `<p class="line partial"><span class="ts"></span>${esc(partial)}<span class="caret"></span></p>` : "");
+      return `<p class="line">${c.showTime ? `<span class="ts">${fmtTime(c.start)}</span>` : `<span class="ts"></span>`}<span>${esc(c.text)}</span></p>`;
+    }).join("") + (partial ? `<p class="line partial"><span class="ts"></span><span>${esc(partial)}<span class="caret"></span></span></p>` : "");
     out.innerHTML = html;
     if ($("#follow").checked) out.lastElementChild?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
@@ -660,7 +679,7 @@ async function renderRecord() {
     busy = true; seq++;
     const window = pcm.length > 28 * 16000 ? pcm.slice(pcm.length - 28 * 16000) : pcm.slice();
     if (pcm.length > 28 * 16000) { offset += (pcm.length - window.length) / 16000; pcm = window.slice(); }
-    worker.postMessage({ type: "live", seq, audio: window, device, f16: DEVICE.f16, language: $("#lLang").value }, [window.buffer]);
+    worker.postMessage({ type: "live", seq, audio: window, device, f16: DEVICE.f16, language: $("#lLang").value, mode: $("#lMode").value }, [window.buffer]);
     if (final) finalSeq = seq;
   }
 
@@ -731,7 +750,7 @@ async function renderRecord() {
     const blob = new Blob(chunks, { type: mediaRec.mimeType || "audio/webm" });
     const ext = (mediaRec.mimeType || "").includes("mp4") ? "m4a" : (mediaRec.mimeType || "").includes("ogg") ? "ogg" : "webm";
     const title = $("#lTitle").value.trim() || "Recording " + fmtDate(Date.now());
-    const id = await addRecording(blob, `${title}.${ext}`, { title, project: $("#lProject").value.trim(), language: $("#lLang").value, source: "record", duration: dur });
+    const id = await addRecording(blob, `${title}.${ext}`, { title, project: $("#lProject").value.trim(), language: $("#lLang").value, mode: $("#lMode").value, source: "record", duration: dur });
     const draftLines = committed.concat(partial ? [{ start: offset, end: dur, text: partial }] : []);
     if (draftLines.length) {
       const r = await DB.get(id);
@@ -760,12 +779,13 @@ async function renderSettings() {
     <div class="settings">
       <section>
         <h2>Speech model</h2>
+        <p class="help">English output uses Whisper large-v3, the model trained to translate (about 1.9 GB, downloaded once). The choice below applies to "Spoken language as is".</p>
         <p class="help">This device: ${DEVICE.webgpu ? (DEVICE.f16 ? "graphics acceleration available, best accuracy supported" : "graphics acceleration available, limited precision") : "no graphics acceleration, standard mode (slower)"}.</p>
         <label class="opt"><input type="radio" name="model" value="" ${cur === "" ? "checked" : ""}><b>Automatic</b><span class="small muted">Uses ${MODEL_INFO[autoModel()].name} on this device.</span></label>
         ${Object.entries(MODEL_INFO).map(([k, v]) => `<label class="opt"><input type="radio" name="model" value="${k}" ${cur === k ? "checked" : ""}><b>${v.name}</b><span class="small muted">${v.detail}</span></label>`).join("")}
         <div class="row" style="margin:32px 0 24px">
-          <label class="field grow"><span>Default language</span><select id="dLang">${langOptions(s.language)}</select></label>
-          <label class="field grow"><span>Output</span><select id="task"><option value="transcribe" ${s.task === "transcribe" ? "selected" : ""}>Transcribe in the spoken language</option><option value="translate" ${s.task === "translate" ? "selected" : ""}>Translate everything to English</option></select></label>
+          <label class="field grow"><span>Text in</span><select id="dMode">${outputOptions(s.mode)}</select></label>
+          <label class="field grow"><span>Spoken language</span><select id="dLang">${langOptions(s.language)}</select></label>
         </div>
         <h2 style="margin-top:48px">Studio glossary</h2>
         <p class="help">One term per line. Correct capitalisation is restored after every transcription.</p>
@@ -792,7 +812,7 @@ async function renderSettings() {
   drawRules();
   $("#addRule").onclick = () => { rules.push({ find: "", replace: "" }); drawRules(); };
   $("#saveS").onclick = () => {
-    saveSettings({ ...s, model: ($$('input[name="model"]').find((r) => r.checked) || {}).value || "", language: $("#dLang").value, task: $("#task").value,
+    saveSettings({ ...s, model: ($$('input[name="model"]').find((r) => r.checked) || {}).value || "", language: $("#dLang").value, mode: $("#dMode").value,
       vocabulary: $("#vocab").value.split("\n").map((x) => x.trim()).filter(Boolean), replacements: rules.filter((r) => r.find.trim()) });
     toast("Settings saved"); updateChip();
   };
@@ -869,8 +889,9 @@ async function buildDocx(r) {
 /* ---------------------------------------------------------------- boot */
 async function updateChip() {
   await checkDevice();
-  const k = chosenModel();
-  $("#engineChip").textContent = `${MODEL_INFO[k].name} · ${DEVICE.webgpu ? "Graphics" : "Standard mode"}${MOCK ? " · TEST MODE" : ""}`;
+  const s = getSettings();
+  const label = s.mode === "english" ? "English output · " + (DEVICE.webgpu ? (DEVICE.f16 ? "Whisper large-v3" : "Whisper medium") : "Whisper small") : MODEL_INFO[chosenModel()].name;
+  $("#engineChip").textContent = `${label} · ${DEVICE.webgpu ? "Graphics" : "Standard mode"}${MOCK ? " · TEST MODE" : ""}`;
 }
 (async () => {
   try { await navigator.storage?.persist?.(); } catch (_) {}
