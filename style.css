@@ -228,3 +228,12 @@ details.adv summary { cursor: pointer; font-family: var(--display); text-transfo
 .opt b { font-weight: 400; }
 .opt .small { grid-column: 2; }
 @media (max-width: 900px) { .jobbar { top: 0; } .jobbar-in { padding: 10px 16px; } }
+
+/* ---------- live transcript (Otter-style) */
+.live-head { display: flex; justify-content: space-between; align-items: baseline; }
+.live-text { max-height: 56vh; overflow-y: auto; padding-right: 8px; scroll-behavior: smooth; }
+.live-text .line { display: grid; grid-template-columns: 64px 1fr; gap: 16px; }
+.live-text .partial { color: var(--muted); }
+.caret { display: inline-block; width: 1px; height: 1.1em; background: var(--accent); margin-left: 4px; vertical-align: -2px; animation: aa-blink 1s steps(2) infinite; }
+@keyframes aa-blink { 50% { opacity: 0; } }
+@media (max-width: 900px) { .live-text .line { grid-template-columns: 48px 1fr; gap: 10px; } .live-text { max-height: 50vh; } }

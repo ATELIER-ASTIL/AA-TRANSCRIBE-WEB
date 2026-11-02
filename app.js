@@ -152,8 +152,10 @@ let active = null;          // { id, resolve, reject }
 const listeners = new Set();
 const emit = (e) => listeners.forEach((f) => f(e));
 
+const liveHandlers = new Set();
 worker.onmessage = async (ev) => {
   const m = ev.data;
+  if (m.type && m.type.startsWith("live-")) { liveHandlers.forEach((f) => f(m)); return; }
   if (!active) return;
   if (m.type === "download") {
     showJob("Downloading speech model", `${Math.round(m.progress || 0)}% of ${m.total ? fmtBytes(m.total) : "…"} · one time only on this browser`, (m.progress || 0) / 100);
@@ -171,7 +173,7 @@ worker.onmessage = async (ev) => {
     if (m.type === "done") {
       const s = getSettings(), fix = makeCorrector(s.vocabulary, s.replacements);
       const segments = mergeSegments(m.segments).map((x, i) => ({ id: i, start: x.start, end: x.end, text: fix(x.text), speaker: "S1" }));
-      await patch(job.id, { status: "done", progress: 1, segments, model: m.model, device: m.device, language: job.language, error: "" });
+      await patch(job.id, { status: "done", draft: false, progress: 1, segments, model: m.model, device: m.device, language: job.language, error: "" });
       toast(`“${job.title}” transcribed`);
     } else {
       await patch(job.id, { status: "error", error: m.message });
@@ -411,7 +413,7 @@ async function renderTranscript(id) {
       <dt>Words</dt><dd>${rec.segments.reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0).toLocaleString("en-IN")}</dd>`;
     const n = $("#notice");
     if (rec.status === "queued" || rec.status === "processing") {
-      n.innerHTML = `<div class="notice"><span class="label">Transcribing</span><div class="small muted">Keep this page open. ${rec.status === "processing" ? Math.round((rec.progress || 0) * 100) + "% done." : "Waiting for the previous file to finish."}</div><div class="bar-mini"><i style="width:${Math.round((rec.progress || 0) * 100)}%"></i></div></div><div class="livebox" id="live">Text will appear here as it is recognised…</div>`;
+      n.innerHTML = `<div class="notice"><span class="label">${rec.draft ? "Refining with the accurate model" : "Transcribing"}</span><div class="small muted">${rec.draft ? "The live draft is shown below and will be replaced by the accurate transcript. " : ""}Keep this page open. ${rec.status === "processing" ? Math.round((rec.progress || 0) * 100) + "% done." : "Waiting for the previous file to finish."}</div><div class="bar-mini"><i style="width:${Math.round((rec.progress || 0) * 100)}%"></i></div></div><div class="livebox" id="live">Text will appear here as it is recognised…</div>`;
     } else if (rec.status === "error") {
       n.innerHTML = `<div class="notice"><span class="label">Not finished</span><div class="small muted">${esc(rec.error || "The page was closed before transcription finished.")}</div><button class="btn" id="retry" style="margin-top:12px">Transcribe now</button></div>`;
       $("#retry").onclick = () => { enqueue(id); patch(id, { status: "queued", error: "" }).then((r) => { rec = r; drawMeta(); }); };
@@ -553,73 +555,194 @@ async function renderTranscript(id) {
   drawMeta(); drawSpeakers(); drawSegments();
 }
 
-/* ---------------------------------------------------------------- record */
+/* ---------------------------------------------------------------- record (live transcript) */
+const LIVE_WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  constructor() { super(); this.ratio = sampleRate / 16000; this.t = 0; this.sum = 0; this.n = 0; this.out = []; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.sum += ch[i]; this.n++; this.t += 1;
+      if (this.t >= this.ratio) { this.out.push(this.sum / this.n); this.sum = 0; this.n = 0; this.t -= this.ratio; }
+    }
+    if (this.out.length >= 1600) { const f = new Float32Array(this.out); this.out = []; this.port.postMessage(f, [f.buffer]); }
+    return true;
+  }
+}
+registerProcessor("aa-tap", Tap);`;
+
 async function renderRecord() {
   const s = getSettings();
   const all = await DB.all();
   const projects = [...new Set(all.map((r) => r.project).filter(Boolean))].sort();
+  await checkDevice();
+  const device = DEVICE.webgpu ? "webgpu" : "wasm";
   view.innerHTML = `
     <div class="live">
-      <span class="eyebrow">02 · Record</span><h1>Record</h1>
-      <div class="muted">Record a meeting or site visit. When you stop, it is transcribed on this device.</div>
+      <span class="eyebrow">02 · Record</span><h1>Live transcript</h1>
+      <div class="muted">Words appear as people speak. When you stop, the full recording is transcribed again with the accurate model.</div>
       <div class="rec-panel">
         <button class="rec-btn" id="rec" aria-label="Start recording"><i></i></button>
         <div><div class="clock" id="clock">00:00:00</div>
-          <div class="small muted" id="recState">Ready. The browser will ask for microphone access.</div>
+          <div class="small muted" id="recState">Preparing the live preview…</div>
           <div class="level"><i id="level"></i></div></div>
       </div>
-      <div class="row" style="margin-bottom:32px">
+      <div class="row" style="margin-bottom:40px">
         <label class="field grow"><span>Title</span><input type="text" id="lTitle" placeholder="e.g. Site meeting — CKPC 3rd floor"></label>
         <label class="field" style="min-width:180px"><span>Project</span><input type="text" id="lProject" list="lp"><datalist id="lp">${projects.map((p) => `<option value="${esc(p)}">`).join("")}</datalist></label>
-        <label class="field" style="min-width:200px"><span>Language</span><select id="lLang">${langOptions(s.language)}</select></label>
+        <label class="field" style="min-width:200px"><span>Language</span><select id="lLang">${langOptions(s.language === "auto" ? "en" : s.language)}</select></label>
       </div>
-      <p class="small muted">Keep this page open and the screen on while recording. Place the phone or laptop in the middle of the table.</p>
+      <div class="live-head"><h2>Transcript</h2><label class="checks" style="margin:0"><label><input type="checkbox" id="follow" checked> Follow</label></label></div>
+      <div class="live-text" id="out"><p class="muted">Press the bronze button and start speaking. Text appears here within a few seconds.</p></div>
     </div>`;
-  let rec = null, stream = null, chunks = [], started = 0, ctx = null, raf = 0, wake = null;
-  const btn = $("#rec");
+
+  const fix = makeCorrector(s.vocabulary, s.replacements);
+  let mediaRec = null, stream = null, chunks = [], started = 0, ctx = null, node = null, raf = 0, wake = null;
+  let pcm = new Float32Array(0), offset = 0, total = 0, busy = false, seq = 0, recording = false, liveReady = false;
+  const committed = [];
+  let partial = "", lastLineAt = -10, finalSeq = -1, finalDone = null;
+  const out = $("#out"), btn = $("#rec");
+
+  const onLive = (m) => {
+    if (m.type === "live-loading") { $("#recState").textContent = `Preparing the live preview · ${Math.round(m.progress || 0)}%`; }
+    else if (m.type === "live-ready") { liveReady = true; if (!recording) $("#recState").textContent = "Ready. The browser will ask for microphone access."; }
+    else if (m.type === "live-error") { busy = false; if (m.seq === finalSeq && finalDone) finalDone(); if (!recording) $("#recState").textContent = "Live preview unavailable on this device. Recording still works and is transcribed when you stop."; }
+    else if (m.type === "live-result") handleResult(m);
+  };
+  liveHandlers.add(onLive);
+  cleanup.push(() => liveHandlers.delete(onLive));
+  worker.postMessage({ type: "live-preload", device });
+
+  function draw() {
+    if (!committed.length && !partial) return;
+    const html = committed.map((c) => {
+      return `<p class="line">${c.showTime ? `<span class="ts">${fmtTime(c.start)}</span>` : `<span class="ts"></span>`}${esc(c.text)}</p>`;
+    }).join("") + (partial ? `<p class="line partial"><span class="ts"></span>${esc(partial)}<span class="caret"></span></p>` : "");
+    out.innerHTML = html;
+    if ($("#follow").checked) out.lastElementChild?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function handleResult(m) {
+    busy = false;
+    if (m.seq !== seq) return;
+    const isFinal = m.seq === finalSeq;
+    const dur = pcm.length / 16000;
+    const segs = m.segments || [];
+    if (!segs.length) {
+      if (isFinal && finalDone) finalDone();
+      if (dur > 8) { const keep = 16000; offset += (pcm.length - keep) / 16000; pcm = pcm.slice(pcm.length - keep); }
+      partial = ""; draw(); return;
+    }
+    let n = 0;
+    for (let i = 0; i < segs.length - 1; i++) if (segs[i].end < dur - 1.5) n = i + 1;
+    if (dur > 20) n = Math.max(n, segs.length - 1);
+    if (isFinal) n = segs.length;
+    for (const sg of segs.slice(0, n)) {
+      const start = offset + sg.start;
+      committed.push({ start, end: offset + sg.end, text: fix(sg.text), showTime: start - lastLineAt >= 30 || !committed.length });
+      if (start - lastLineAt >= 30 || committed.length === 1) lastLineAt = start;
+    }
+    if (n) {
+      const cut = Math.min(pcm.length, Math.floor(segs[n - 1].end * 16000));
+      pcm = pcm.slice(cut); offset += cut / 16000;
+    }
+    partial = fix(segs.slice(n).map((x) => x.text).join(" "));
+    draw();
+    if (isFinal && finalDone) finalDone();
+  }
+
+  function pump(final = false) {
+    if ((busy && !final) || !liveReady) return;
+    if (!final && pcm.length < 16000) return;
+    busy = true; seq++;
+    const window = pcm.length > 28 * 16000 ? pcm.slice(pcm.length - 28 * 16000) : pcm.slice();
+    if (pcm.length > 28 * 16000) { offset += (pcm.length - window.length) / 16000; pcm = window.slice(); }
+    worker.postMessage({ type: "live", seq, audio: window, device, language: $("#lLang").value }, [window.buffer]);
+    if (final) finalSeq = seq;
+  }
+
   async function start() {
     if (!window.isSecureContext) return toast("Recording needs the https address of this page.", 6000);
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
     catch (_) { return toast("Microphone permission was refused.", 5000); }
     const types = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm", "audio/ogg;codecs=opus"];
     const mimeType = types.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
-    rec = new MediaRecorder(stream, mimeType ? { mimeType, audioBitsPerSecond: 64000 } : undefined);
+    mediaRec = new MediaRecorder(stream, mimeType ? { mimeType, audioBitsPerSecond: 64000 } : undefined);
     chunks = [];
-    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-    rec.onstop = finish;
-    rec.start(1000);
-    started = Date.now();
-    btn.classList.add("on"); btn.setAttribute("aria-label", "Stop recording");
-    $("#recState").textContent = "Recording. Tap the button again to stop.";
-    every(() => { $("#clock").textContent = fmtTime((Date.now() - started) / 1000, true); }, 500);
+    mediaRec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    mediaRec.onstop = finish;
+    mediaRec.start(1000);
+
     ctx = new AudioContext();
-    const an = ctx.createAnalyser(); an.fftSize = 512; ctx.createMediaStreamSource(stream).connect(an);
-    const data = new Uint8Array(an.fftSize);
-    const loop = () => { an.getByteTimeDomainData(data); let p = 0; for (const v of data) p = Math.max(p, Math.abs(v - 128)); $("#level") && ($("#level").style.width = Math.min(100, p / 128 * 160) + "%"); raf = requestAnimationFrame(loop); };
-    loop();
+    const url = URL.createObjectURL(new Blob([LIVE_WORKLET], { type: "application/javascript" }));
+    await ctx.audioWorklet.addModule(url);
+    const src = ctx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(ctx, "aa-tap");
+    src.connect(node);
+    node.port.onmessage = (e) => {
+      const f = e.data;
+      const merged = new Float32Array(pcm.length + f.length); merged.set(pcm); merged.set(f, pcm.length); pcm = merged;
+      total += f.length;
+      let peak = 0; for (let i = 0; i < f.length; i += 4) { const a = Math.abs(f[i]); if (a > peak) peak = a; }
+      const lv = $("#level"); if (lv) lv.style.width = Math.min(100, Math.sqrt(peak) * 120) + "%";
+    };
+
+    recording = true; started = Date.now();
+    out.innerHTML = `<p class="muted">Listening…</p>`;
+    btn.classList.add("on"); btn.setAttribute("aria-label", "Stop recording");
+    $("#recState").textContent = liveReady ? "Recording · live transcript on" : "Recording · live preview is still loading";
+    every(() => { $("#clock").textContent = fmtTime((Date.now() - started) / 1000, true); }, 500);
+    every(() => { if (recording) pump(); }, 700);
     try { wake = await navigator.wakeLock?.request("screen"); } catch (_) {}
   }
+
   function stopAll() {
-    cancelAnimationFrame(raf);
+    recording = false;
+    try { node && node.disconnect(); } catch (_) {}
     try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
     try { if (ctx && ctx.state !== "closed") ctx.close().catch(() => {}); } catch (_) {}
     try { wake && wake.release(); } catch (_) {}
     btn.classList.remove("on");
+    const lv = $("#level"); if (lv) lv.style.width = "0";
   }
-  function stop() { if (rec && rec.state !== "inactive") { $("#recState").textContent = "Saving…"; rec.stop(); } stopAll(); }
+
+  function stop() {
+    $("#recState").textContent = "Finishing the last words…";
+    stopAll();
+    if (mediaRec && mediaRec.state !== "inactive") mediaRec.stop();
+  }
+
   async function finish() {
     const dur = (Date.now() - started) / 1000;
     if (dur < 1 || !chunks.length) { toast("Nothing was recorded."); return; }
-    const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
-    const ext = (rec.mimeType || "").includes("mp4") ? "m4a" : (rec.mimeType || "").includes("ogg") ? "ogg" : "webm";
+    // final pass on the remaining audio so the draft is complete
+    if (liveReady && pcm.length > 8000) {
+      await new Promise((res) => {
+        finalDone = res;
+        const t0 = Date.now();
+        const wait = () => { if (!busy) pump(true); else if (Date.now() - t0 < 12000) setTimeout(wait, 150); else res(); };
+        wait(); setTimeout(res, 15000);
+      });
+      finalDone = null;
+    }
+    const blob = new Blob(chunks, { type: mediaRec.mimeType || "audio/webm" });
+    const ext = (mediaRec.mimeType || "").includes("mp4") ? "m4a" : (mediaRec.mimeType || "").includes("ogg") ? "ogg" : "webm";
     const title = $("#lTitle").value.trim() || "Recording " + fmtDate(Date.now());
     const id = await addRecording(blob, `${title}.${ext}`, { title, project: $("#lProject").value.trim(), language: $("#lLang").value, source: "record", duration: dur });
+    const draftLines = committed.concat(partial ? [{ start: offset, end: dur, text: partial }] : []);
+    if (draftLines.length) {
+      const r = await DB.get(id);
+      if (r && r.status !== "done") { r.segments = draftLines.map((c, i) => ({ id: i, start: c.start, end: c.end, text: c.text, speaker: "S1" })); r.draft = true; await DB.put(r); }
+    }
+    toast("Saved. Refining with the accurate model…", 4000);
     location.hash = `#/r/${id}`;
   }
-  btn.onclick = () => (rec && rec.state === "recording" ? stop() : start());
-  const guard = (e) => { if (rec && rec.state === "recording") { e.preventDefault(); e.returnValue = ""; } };
+
+  btn.onclick = () => (recording ? stop() : start());
+  const guard = (e) => { if (recording) { e.preventDefault(); e.returnValue = ""; } };
   window.addEventListener("beforeunload", guard);
-  cleanup.push(() => { window.removeEventListener("beforeunload", guard); if (rec && rec.state === "recording") stop(); else stopAll(); });
+  cleanup.push(() => { window.removeEventListener("beforeunload", guard); if (recording) stop(); else stopAll(); });
 }
 
 /* ---------------------------------------------------------------- settings */

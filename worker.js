@@ -90,8 +90,56 @@ async function mockTranscribe({ id, audio }) {
   return { segments, device: "test", model: "test" };
 }
 
+/* ---------------- live preview: a small fast model decodes the last few seconds while people talk */
+let livePipe = null, liveKey = "", liveLoading = null;
+async function loadLive(device) {
+  const name = device === "webgpu" ? "onnx-community/whisper-base" : "onnx-community/whisper-tiny";
+  const key = name + device;
+  if (livePipe && liveKey === key) return livePipe;
+  if (liveLoading) return liveLoading;
+  T = T || await import(LIB);
+  T.env.allowLocalModels = false;
+  liveLoading = T.pipeline("automatic-speech-recognition", name, {
+    device, dtype: device === "webgpu" ? { encoder_model: "fp32", decoder_model_merged: "q4" } : "q8",
+    progress_callback: (p) => { if (p.status === "progress_total") postMessage({ type: "live-loading", progress: p.progress }); },
+  }).then((p) => { livePipe = p; liveKey = key; liveLoading = null; postMessage({ type: "live-ready" }); return p; })
+    .catch((e) => { liveLoading = null; throw e; });
+  return liveLoading;
+}
+
+async function liveDecode({ seq, audio, device, language }) {
+  if (MOCK) {
+    const n = Math.floor(audio.length / 16000);
+    const words = "the client approved the walnut veneer for the lobby ceiling and asked for a revised boq by friday".split(" ");
+    const segs = [];
+    for (let i = 0; i < n; i += 3) segs.push({ start: i, end: Math.min(n, i + 2.8), text: words.slice(i % 12, i % 12 + 5).join(" ") });
+    return { seq, segments: segs, device: "test" };
+  }
+  let pipe;
+  try { pipe = await loadLive(device); }
+  catch (e) { if (device !== "webgpu") throw e; device = "wasm"; pipe = await loadLive("wasm"); }
+  const opts = { return_timestamps: true };
+  if (language && language !== "auto") { opts.language = language; opts.task = "transcribe"; }
+  const out = await pipe(audio, opts);
+  const dur = audio.length / 16000;
+  const segments = (out.chunks || [{ timestamp: [0, dur], text: out.text }])
+    .map((c) => ({ start: c.timestamp[0] ?? 0, end: c.timestamp[1] ?? dur, text: (c.text || "").trim() }))
+    .filter((c) => c.text && !/^[\[(].*[\])]$/.test(c.text));
+  return { seq, segments, device };
+}
+
 self.onmessage = async (e) => {
   const msg = e.data;
+  if (msg.type === "live-preload") {
+    if (!MOCK) loadLive(msg.device).catch((err) => postMessage({ type: "live-error", message: String(err && err.message || err) }));
+    else postMessage({ type: "live-ready" });
+    return;
+  }
+  if (msg.type === "live") {
+    try { postMessage({ type: "live-result", ...(await liveDecode(msg)) }); }
+    catch (err) { postMessage({ type: "live-error", seq: msg.seq, message: String(err && err.message || err) }); }
+    return;
+  }
   if (msg.type !== "transcribe") return;
   try {
     const result = MOCK ? await mockTranscribe(msg) : await transcribe(msg);
