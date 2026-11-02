@@ -4,7 +4,10 @@ const MOCK = new URL(self.location.href).searchParams.get("mock") === "1";
 const LIB = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1/dist/transformers.min.js";
 
 let T = null;            // library module
-let current = null;      // { key, pipe, device }
+// One model run at a time: the graphics session cannot run two passes at once.
+let gate = Promise.resolve();
+function exclusive(fn) { const run = gate.then(fn, fn); gate = run.catch(() => {}); return run; }
+const pipes = new Map(); // "key|device" -> Promise<pipeline>  (shared by live preview and full transcription)
 
 const MODELS = {
   best: "onnx-community/whisper-large-v3-turbo",
@@ -12,15 +15,24 @@ const MODELS = {
   fast: "onnx-community/whisper-base",
 };
 
+// Full precision wherever the device allows it: compressed (q4) weights cost accuracy.
 function dtypeFor(key, device, f16) {
   if (device === "wasm") return "q8";
-  if (key === "best") return { encoder_model: f16 ? "fp16" : "fp32", decoder_model_merged: "q4" };
-  return { encoder_model: "fp32", decoder_model_merged: "q4" };
+  if (f16) return { encoder_model: "fp16", decoder_model_merged: "fp16" };
+  if (key === "best") return { encoder_model: "fp32", decoder_model_merged: "q4" };
+  return { encoder_model: "fp32", decoder_model_merged: "fp32" };
 }
 
-async function load(key, device, f16) {
-  if (current && current.key === key && current.device === device) return current.pipe;
-  if (current) { try { await current.pipe.dispose(); } catch (_) {} current = null; }
+function load(key, device, f16) {
+  const id = key + "|" + device;
+  if (!pipes.has(id)) {
+    const p = create(key, device, f16).catch((e) => { pipes.delete(id); throw e; });
+    pipes.set(id, p);
+  }
+  return pipes.get(id);
+}
+
+async function create(key, device, f16) {
   T = T || await import(LIB);
   T.env.allowLocalModels = false;
   const files = {};
@@ -37,7 +49,6 @@ async function load(key, device, f16) {
       }
     },
   });
-  current = { key, pipe, device };
   return pipe;
 }
 
@@ -67,7 +78,7 @@ async function transcribe({ id, audio, key, device, f16, language, task }) {
   if (language && language !== "auto") opts.language = language;
   if (task === "translate") opts.task = "translate";
   else if (language && language !== "auto") opts.task = "transcribe";
-  const out = await pipe(audio, opts);
+  const out = await exclusive(() => pipe(audio, opts));
   const duration = audio.length / sr;
   const segments = (out.chunks || [{ timestamp: [0, duration], text: out.text }])
     .map((c) => ({ start: c.timestamp[0] ?? 0, end: c.timestamp[1] ?? duration, text: (c.text || "").trim() }))
@@ -91,23 +102,30 @@ async function mockTranscribe({ id, audio }) {
 }
 
 /* ---------------- live preview: a small fast model decodes the last few seconds while people talk */
-let livePipe = null, liveKey = "", liveLoading = null;
-async function loadLive(device) {
-  const name = device === "webgpu" ? "onnx-community/whisper-base" : "onnx-community/whisper-tiny";
-  const key = name + device;
-  if (livePipe && liveKey === key) return livePipe;
-  if (liveLoading) return liveLoading;
-  T = T || await import(LIB);
-  T.env.allowLocalModels = false;
-  liveLoading = T.pipeline("automatic-speech-recognition", name, {
-    device, dtype: device === "webgpu" ? { encoder_model: "fp32", decoder_model_merged: "q4" } : "q8",
-    progress_callback: (p) => { if (p.status === "progress_total") postMessage({ type: "live-loading", progress: p.progress }); },
-  }).then((p) => { livePipe = p; liveKey = key; liveLoading = null; postMessage({ type: "live-ready" }); return p; })
-    .catch((e) => { liveLoading = null; throw e; });
-  return liveLoading;
+// Live text uses the same large model as the final transcript when the graphics chip supports it,
+// so what you see while talking is already close to final. Otherwise the best model the device can keep up with.
+function liveKeyFor(device, f16) { return device === "webgpu" ? (f16 ? "best" : "balanced") : "fast"; }
+let liveAnnounced = false;
+async function loadLive(device, f16) {
+  const key = liveKeyFor(device, f16);
+  const id = key + "|" + device;
+  if (!pipes.has(id)) {
+    const p = (async () => {
+      T = T || await import(LIB);
+      T.env.allowLocalModels = false;
+      return T.pipeline("automatic-speech-recognition", MODELS[key], {
+        device, dtype: dtypeFor(key, device, f16),
+        progress_callback: (q) => { if (q.status === "progress_total") postMessage({ type: "live-loading", progress: q.progress, total: q.total }); },
+      });
+    })().catch((e) => { pipes.delete(id); throw e; });
+    pipes.set(id, p);
+  }
+  const pipe = await pipes.get(id);
+  if (!liveAnnounced) { liveAnnounced = true; postMessage({ type: "live-ready", model: MODELS[key] }); }
+  return pipe;
 }
 
-async function liveDecode({ seq, audio, device, language }) {
+async function liveDecode({ seq, audio, device, f16, language }) {
   if (MOCK) {
     const n = Math.floor(audio.length / 16000);
     const words = "the client approved the walnut veneer for the lobby ceiling and asked for a revised boq by friday".split(" ");
@@ -116,11 +134,11 @@ async function liveDecode({ seq, audio, device, language }) {
     return { seq, segments: segs, device: "test" };
   }
   let pipe;
-  try { pipe = await loadLive(device); }
-  catch (e) { if (device !== "webgpu") throw e; device = "wasm"; pipe = await loadLive("wasm"); }
+  try { pipe = await loadLive(device, f16); }
+  catch (e) { if (device !== "webgpu") throw e; device = "wasm"; pipe = await loadLive("wasm", false); }
   const opts = { return_timestamps: true };
   if (language && language !== "auto") { opts.language = language; opts.task = "transcribe"; }
-  const out = await pipe(audio, opts);
+  const out = await exclusive(() => pipe(audio, opts));
   const dur = audio.length / 16000;
   const segments = (out.chunks || [{ timestamp: [0, dur], text: out.text }])
     .map((c) => ({ start: c.timestamp[0] ?? 0, end: c.timestamp[1] ?? dur, text: (c.text || "").trim() }))
@@ -131,7 +149,7 @@ async function liveDecode({ seq, audio, device, language }) {
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type === "live-preload") {
-    if (!MOCK) loadLive(msg.device).catch((err) => postMessage({ type: "live-error", message: String(err && err.message || err) }));
+    if (!MOCK) loadLive(msg.device, msg.f16).catch((err) => postMessage({ type: "live-error", message: String(err && err.message || err) }));
     else postMessage({ type: "live-ready" });
     return;
   }

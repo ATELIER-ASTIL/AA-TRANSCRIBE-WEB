@@ -17,8 +17,8 @@ const LANGS = [
 ];
 const langName = (c) => (LANGS.find((l) => l[0] === c) || [c, (c || "—").toUpperCase()])[1];
 const MODEL_INFO = {
-  best: { name: "Best accuracy", detail: "Whisper large-v3-turbo · about 1 GB, downloaded once · needs a laptop or desktop with graphics acceleration" },
-  balanced: { name: "Balanced", detail: "Whisper small · about 250 MB · works on most computers and newer phones" },
+  best: { name: "Best accuracy", detail: "Whisper large-v3-turbo at full precision · about 1.6 GB, downloaded once · used for live text too · needs a laptop or desktop with graphics acceleration" },
+  balanced: { name: "Balanced", detail: "Whisper small · 500 MB to 1 GB depending on the device · works on most computers" },
   fast: { name: "Fast", detail: "Whisper base · about 80 MB · quick drafts, lower accuracy" },
 };
 
@@ -197,8 +197,9 @@ function mergeSegments(chunks) {
 }
 
 function enqueue(id) { if (!queue.includes(id) && (!active || active.id !== id)) queue.push(id); next(); }
+let recordingNow = false;   // full transcriptions wait while a live recording is running
 async function next() {
-  if (active || !queue.length) return;
+  if (active || !queue.length || recordingNow) return;
   const id = queue.shift();
   const rec = await DB.get(id);
   if (!rec) return next();
@@ -605,14 +606,14 @@ async function renderRecord() {
   const out = $("#out"), btn = $("#rec");
 
   const onLive = (m) => {
-    if (m.type === "live-loading") { $("#recState").textContent = `Preparing the live preview · ${Math.round(m.progress || 0)}%`; }
+    if (m.type === "live-loading") { $("#recState").textContent = `Downloading the speech model, one time only · ${Math.round(m.progress || 0)}%${m.total ? " of " + fmtBytes(m.total) : ""}`; }
     else if (m.type === "live-ready") { liveReady = true; if (!recording) $("#recState").textContent = "Ready. The browser will ask for microphone access."; }
     else if (m.type === "live-error") { busy = false; if (m.seq === finalSeq && finalDone) finalDone(); if (!recording) $("#recState").textContent = "Live preview unavailable on this device. Recording still works and is transcribed when you stop."; }
     else if (m.type === "live-result") handleResult(m);
   };
   liveHandlers.add(onLive);
   cleanup.push(() => liveHandlers.delete(onLive));
-  worker.postMessage({ type: "live-preload", device });
+  worker.postMessage({ type: "live-preload", device, f16: DEVICE.f16 });
 
   function draw() {
     if (!committed.length && !partial) return;
@@ -635,8 +636,9 @@ async function renderRecord() {
       partial = ""; draw(); return;
     }
     let n = 0;
-    for (let i = 0; i < segs.length - 1; i++) if (segs[i].end < dur - 1.5) n = i + 1;
-    if (dur > 20) n = Math.max(n, segs.length - 1);
+    for (let i = 0; i < segs.length - 1; i++) if (segs[i].end < dur - 3 && /[.?!]$/.test(segs[i].text)) n = i + 1;
+    if (!n) for (let i = 0; i < segs.length - 1; i++) if (segs[i].end < dur - 6) n = i + 1;
+    if (dur > 24) n = Math.max(n, segs.length - 1);
     if (isFinal) n = segs.length;
     for (const sg of segs.slice(0, n)) {
       const start = offset + sg.start;
@@ -658,7 +660,7 @@ async function renderRecord() {
     busy = true; seq++;
     const window = pcm.length > 28 * 16000 ? pcm.slice(pcm.length - 28 * 16000) : pcm.slice();
     if (pcm.length > 28 * 16000) { offset += (pcm.length - window.length) / 16000; pcm = window.slice(); }
-    worker.postMessage({ type: "live", seq, audio: window, device, language: $("#lLang").value }, [window.buffer]);
+    worker.postMessage({ type: "live", seq, audio: window, device, f16: DEVICE.f16, language: $("#lLang").value }, [window.buffer]);
     if (final) finalSeq = seq;
   }
 
@@ -688,7 +690,7 @@ async function renderRecord() {
       const lv = $("#level"); if (lv) lv.style.width = Math.min(100, Math.sqrt(peak) * 120) + "%";
     };
 
-    recording = true; started = Date.now();
+    recording = true; recordingNow = true; started = Date.now();
     out.innerHTML = `<p class="muted">Listening…</p>`;
     btn.classList.add("on"); btn.setAttribute("aria-label", "Stop recording");
     $("#recState").textContent = liveReady ? "Recording · live transcript on" : "Recording · live preview is still loading";
@@ -698,7 +700,7 @@ async function renderRecord() {
   }
 
   function stopAll() {
-    recording = false;
+    recording = false; recordingNow = false;
     try { node && node.disconnect(); } catch (_) {}
     try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
     try { if (ctx && ctx.state !== "closed") ctx.close().catch(() => {}); } catch (_) {}
