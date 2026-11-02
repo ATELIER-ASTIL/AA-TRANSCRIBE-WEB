@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AA Transcribe</title>
+<meta name="description" content="Atelier Astil transcription. Speech to text inside your browser; recordings never leave your device.">
+<link rel="icon" href="img/monogram-bronze.svg">
+<link rel="apple-touch-icon" href="img/apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#F6F1E8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar">
+  <a href="#/" class="brand" aria-label="AA Transcribe home"><img src="img/wordmark-ink.svg" alt="Atelier Astil" class="lockup"></a>
+  <nav class="nav">
+    <a href="#/" data-nav="library">Library</a>
+    <a href="#/record" data-nav="record">Record</a>
+    <a href="#/settings" data-nav="settings">Settings</a>
+  </nav>
+  <span class="engine-chip" id="engineChip"></span>
+</header>
+<div class="jobbar" id="jobbar" hidden><div class="jobbar-in"><span class="label" id="jobLabel"></span><span class="small muted" id="jobText"></span><div class="bar-mini"><i id="jobFill"></i></div></div></div>
+<main id="view"></main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="filePick" accept="audio/*,video/*,.m4a,.opus,.amr" multiple hidden>
+<img class="seal" src="img/monogram-bronze.svg" alt="">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
